@@ -1,9 +1,12 @@
 from django.shortcuts import render, redirect
 from django.urls import reverse
 import re
+from django_redis import get_redis_connection
+from utils.minxi import LoginRequireMixin
 from celery_tasks.tasks import send_register_active_email
-from .models import User
-from django.contrib.auth import authenticate,login
+from .models import User, Address
+from apps.goods.models import GoodsSKU
+from django.contrib.auth import authenticate, login, logout
 from django.views import View
 from django.conf import settings
 from itsdangerous import TimedJSONWebSignatureSerializer as Serializer
@@ -88,7 +91,14 @@ class ActiveView(View):
 class LoginView(View):
     '''登陆页面'''
     def get(self, request):
-        return render(request, 'login.html')
+        # 判断是否记住用户名
+        if 'username' not in request.COOKIES:
+            username = ''
+            checked = ''
+        else:
+            username = request.COOKIES.get('username')
+            checked = 'checked'
+        return render(request, 'login.html', {'username': username, 'checked': checked})
 
     def post(self, request):
         '''处理登录校验'''
@@ -100,13 +110,103 @@ class LoginView(View):
             return render(request, 'login.html', {"error_msg": "数据不完整"})
 
         user = authenticate(username=username, password=password)
-        if user is None:
+        if user is not None:
+            if user.is_active:
+                # 用户激活 记录用户登录状态
+                login(request, user)
+                # 未登录访问用户中心页面需要进行登录然后进行跳转
+                next_url = request.GET.get('next', reverse('goods:index'))
+                response = redirect(next_url)  # HttpResponseRedirect
+                # 获取就记住用户名状态
+                remember = request.POST.get('remember')
+                if remember == 'on':
+                    response.set_cookie('username', username, max_age=60*60*24*7)
+                else:
+                    response.delete_cookie('username')
+                return response
+            else:
+                return render(request, 'login.html', {"error_msg": "账号未激活"})
+        else:
             return render(request, 'login.html', {"error_msg": "用户名或密码错误"})
 
-        if user.is_active:
-            login(request, user)
-            return redirect(reverse('goods:index'))
-
-        return render(request, 'login.html', {"error_msg": "用户未激活"})
-
         # 业务处理
+
+
+class LogoutView(View):
+    """退出登录"""
+    def get(self, request):
+        """退出登录"""
+        # 清除用户session信息
+        logout(request)
+        return redirect(reverse('goods:index'))
+
+
+
+class UserInfoView(LoginRequireMixin, View):
+    """用户中心信息页面"""
+    def get(self, request):
+        page = 'user'
+        # 获取用户个人信息
+        user = request.user
+        address = Address.objects.get_default_address(user)
+        # 获取用户历史浏览
+        conn = get_redis_connection('default')
+
+        history_key = f'history_{user.id}'
+        sku_ids = conn.lrange(history_key, 0, 4)
+        goods_li = []
+        for i in sku_ids:
+            good = GoodsSKU.objects.get(id=i)
+            goods_li.append(good)
+
+        return render(request, 'user_center_info.html', {'page': page, 'address': address, 'goods_li': goods_li})
+
+
+class UserAddressView(LoginRequireMixin, View):
+    """用户中心地址页面"""
+    def get(self, request):
+        page = 'address'
+        user = request.user
+        # try:
+        #     address = Address.objects.get(user=user, is_default=True)
+        # except Address.DoesNotExist:
+        #     address = None
+        address = Address.objects.get_default_address(user)
+        return render(request, 'user_center_site.html', {'page': page, 'address': address})
+
+    def post(self, request):
+        # 接受传过来的地址参数
+        receiver = request.POST.get('receiver')
+        addr = request.POST.get('addr')
+        zip_code = request.POST.get('zip_code')
+        phone = request.POST.get('phone')
+        if not all([receiver, addr, phone]):
+            return render(request, 'user_center_site.html', {'error_msg': '数据不完整'})
+        if not re.match(r'^1[3|4|5|7|8][0-9]{9}$', phone):
+            return render(request, 'user_center_site.html', {'error_msg': '电话格式不正确'})
+        # 判断用户是否有默认收货地址
+        user = request.user
+        # try:
+        #     address = Address.objects.get(user=user, is_default=True)
+        # except Address.DoesNotExist:
+        #     address = None
+        address = Address.objects.get_default_address(user)
+        if address:
+            is_default = False
+        else:
+            is_default = True
+        Address.objects.create(user=user,
+                               receiver=receiver,
+                               addr=addr,
+                               zip_code=zip_code,
+                               phone=phone,
+                               is_default=is_default)
+        return redirect(reverse('user:address'))
+
+
+
+class UserOrderView(LoginRequireMixin, View):
+    """用户中心订单页面"""
+    def get(self, request):
+        page = 'order'
+        return render(request, 'user_center_order.html', {'page': page})
